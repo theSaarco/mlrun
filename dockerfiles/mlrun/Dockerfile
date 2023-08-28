@@ -24,8 +24,32 @@ ENV PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && apt-get install --no-install-recommends -y \
   gcc \
+  g++  \
+  build-essential \
+  make  \
   git-core \
+  wget \
  && rm -rf /var/lib/apt/lists/*
+
+#### INSTALL OPENMPI ####
+# Source is available at https://www.open-mpi.org/software/ompi/
+
+# Build Options:
+# These options are passed to the steps below
+ARG OPENMPI_VERSION="4.1.5"
+ARG OPENMPI_MAJOR_VERSION="v4.1"
+ARG OPENMPI_CONFIGURE_OPTIONS
+ARG OPENMPI_MAKE_OPTIONS="-j4"
+
+# Download, build, and install OPENMPI
+RUN mkdir /tmp/openmpi-src
+WORKDIR /tmp/openmpi-src
+RUN wget https://download.open-mpi.org/release/open-mpi/${OPENMPI_MAJOR_VERSION}/openmpi-${OPENMPI_VERSION}.tar.gz \
+      && tar xfz openmpi-${OPENMPI_VERSION}.tar.gz
+RUN cd openmpi-${OPENMPI_VERSION} && ./configure ${OPENMPI_CONFIGURE_OPTIONS}
+RUN cd openmpi-${OPENMPI_VERSION} && make all ${OPENMPI_MAKE_OPTIONS}
+RUN cd openmpi-${OPENMPI_VERSION} && make install
+RUN rm -rf /tmp/openmpi-src
 
 WORKDIR /mlrun
 
