@@ -396,7 +396,7 @@ def run(
         # handle the case of module.submodule.handler
         update_in(runtime, "kind", "local")
 
-    if kfp or runobj.spec.verbose or verbose:
+    if (kfp and mlconf.log_kfp_artifacts) or runobj.spec.verbose or verbose:
         print(f"MLRun version: {str(Version().get())}")
         print("Runtime:")
         pprint(runtime)

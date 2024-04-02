@@ -65,6 +65,9 @@ def write_kfpmeta(struct):
     if "status" not in struct:
         return
 
+    if not config.write_kfp_metadata:
+        return
+
     results = struct["status"].get("results", {})
     metrics = {
         "metrics": [
