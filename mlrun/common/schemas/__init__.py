@@ -223,6 +223,7 @@ from .secret import (
     DeleteSecretTokenResponse,
     DeleteSecretTokensResponse,
     ListSecretTokensResponse,
+    RetrievableSecretsData,
     SecretKeysData,
     SecretProviderName,
     SecretsData,

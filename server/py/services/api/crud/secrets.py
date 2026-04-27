@@ -56,6 +56,7 @@ class Secrets(
     internal_secrets_key_prefix = "mlrun."
     # make it a subset of internal since key map are by definition internal
     key_map_secrets_key_prefix = f"{internal_secrets_key_prefix}map."
+    retrievable_keys_secret_key = f"{internal_secrets_key_prefix}retrievable-keys"
 
     def __init__(self):
         if mlconf.secret_stores.test_mode_mock_secrets:
@@ -127,6 +128,31 @@ class Secrets(
             key_map_secret_key,
             allow_storing_key_maps,
         )
+
+        # Handle retrievable_keys: validate, merge with existing list, and inject the
+        # metadata key into secrets_to_store AFTER _validate_and_enrich runs so that
+        # (a) the internal key bypasses the user-key regex/permission loop, and
+        # (b) we don't crash on secrets.secrets being None.
+        if secrets.retrievable_keys and secrets.provider == mlrun.common.schemas.SecretProviderName.kubernetes:
+            for rk in secrets.retrievable_keys:
+                if self.is_internal_project_secret_key(rk):
+                    raise mlrun.errors.MLRunAccessDeniedError(
+                        f"Not allowed to mark internal keys as retrievable (key starts with "
+                        f"{self.internal_secrets_key_prefix})"
+                    )
+                if rk not in (secrets_to_store or {}):
+                    raise mlrun.errors.MLRunInvalidArgumentError(
+                        f"Retrievable key '{rk}' is not present in the secrets being stored"
+                    )
+            existing_retrievable = self._get_retrievable_keys_list(project)
+            updated_retrievable = sorted(
+                set(existing_retrievable) | set(secrets.retrievable_keys)
+            )
+            if secrets_to_store is None:
+                secrets_to_store = {}
+            secrets_to_store[self.retrievable_keys_secret_key] = json.dumps(
+                updated_retrievable
+            )
 
         if secrets.provider == mlrun.common.schemas.SecretProviderName.vault:
             # Init is idempotent and will do nothing if infra is already in place
@@ -222,6 +248,10 @@ class Secrets(
         secrets: list[str] | None = None,
         allow_internal_secrets: bool = False,
     ):
+        # Track whether this is a delete-all call (no specific keys listed) so we can
+        # clean up mlrun.retrievable-keys after the main delete.
+        is_delete_all = not secrets
+
         if not allow_internal_secrets:
             if secrets:
                 for secret_key in secrets:
@@ -260,6 +290,38 @@ class Secrets(
                         action=action,
                     )
                     events_client.emit(event)
+
+                # Clean up mlrun.retrievable-keys metadata after deleting user keys.
+                # We call the provider directly (not store_project_secrets) to avoid
+                # emitting an unnecessary event for an internal metadata cleanup.
+                if is_delete_all:
+                    # Delete-all path: wipe the retrievable-keys metadata key too.
+                    self.secrets_provider.delete_project_secrets(
+                        project, [self.retrievable_keys_secret_key]
+                    )
+                else:
+                    # Per-key path: remove deleted keys from the retrievable list.
+                    deleted_set = set(secrets or [])
+                    existing_retrievable = self._get_retrievable_keys_list(project)
+                    if existing_retrievable:
+                        updated_retrievable = [
+                            k for k in existing_retrievable if k not in deleted_set
+                        ]
+                        if len(updated_retrievable) != len(existing_retrievable):
+                            # Some retrievable keys were deleted — update or remove metadata.
+                            if updated_retrievable:
+                                self.secrets_provider.store_project_secrets(
+                                    project,
+                                    {
+                                        self.retrievable_keys_secret_key: json.dumps(
+                                            updated_retrievable
+                                        )
+                                    },
+                                )
+                            else:
+                                self.secrets_provider.delete_project_secrets(
+                                    project, [self.retrievable_keys_secret_key]
+                                )
 
             else:
                 raise mlrun.errors.MLRunInternalServerError(
@@ -804,6 +866,96 @@ class Secrets(
         # Different user - fetch user_id from Iguazio API
         iguazio_client = framework.utils.clients.iguazio.v4.Client()
         return iguazio_client.get_user_id_by_username(username, auth_info)
+
+    def _get_retrievable_keys_list(self, project: str) -> list[str]:
+        """Read the mlrun.retrievable-keys metadata key from the K8s secret.
+
+        Calls the provider directly to bypass the allow_secrets_from_k8s guard — this is an
+        internal server read, not a user-facing retrieval.
+
+        :param project: The project name.
+        :return: The list of key names that are marked as retrievable. Returns [] if the metadata
+            key does not exist or is empty.
+        """
+        raw = self.secrets_provider.get_project_secret_data(
+            project, [self.retrievable_keys_secret_key]
+        )
+        value = raw.get(self.retrievable_keys_secret_key) if raw else None
+        if not value:
+            return []
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                "Failed to decode retrievable-keys metadata, returning empty list",
+                project=project,
+            )
+            return []
+
+    def list_retrievable_project_secrets(
+        self,
+        project: str,
+        secrets: list[str] | None = None,
+    ) -> mlrun.common.schemas.RetrievableSecretsData:
+        """Retrieve project secrets that were stored with a retrievable_keys marking.
+
+        Returns only the keys listed in the internal mlrun.retrievable-keys metadata.
+        Stale entries (keys in the metadata list but no longer present in the K8s secret)
+        are silently ignored. Internal keys are never returned.
+
+        A single K8s read is used to fetch both the metadata list and the secret values.
+
+        :param project: The project name.
+        :param secrets: Optional list of specific key names to retrieve. If None, all
+            retrievable keys are returned. A requested key that is not in the retrievable set
+            raises MLRunNotFoundError.
+        :return: RetrievableSecretsData containing the ciphertext values for marked keys.
+        :raises mlrun.errors.MLRunInvalidArgumentError: If the provider is not kubernetes.
+        :raises mlrun.errors.MLRunNotFoundError: If a requested key is not in the retrievable set.
+        """
+        # Single K8s read: fetch all secret data so we can extract both the metadata list
+        # and the actual values without a second round-trip to the provider.
+        all_data = self.secrets_provider.get_project_secret_data(project, None) or {}
+
+        # Extract the retrievable-keys metadata list from the same response.
+        raw_metadata = all_data.get(self.retrievable_keys_secret_key)
+        if not raw_metadata:
+            retrievable_set: list[str] = []
+        else:
+            try:
+                retrievable_set = json.loads(raw_metadata)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    "Failed to decode retrievable-keys metadata, treating as empty",
+                    project=project,
+                )
+                retrievable_set = []
+
+        if secrets is not None:
+            # Validate that all requested keys are in the retrievable set.
+            # Return 404 for any key not marked retrievable (whether or not the key
+            # exists as a non-retrievable data key — we intentionally do not reveal that).
+            for requested_key in secrets:
+                if requested_key not in retrievable_set:
+                    raise mlrun.errors.MLRunNotFoundError(
+                        f"Secret '{requested_key}' is not available as a retrievable secret"
+                    )
+            keys_to_return = secrets
+        else:
+            keys_to_return = retrievable_set
+
+        # Build the response: intersect with actual data keys to handle stale metadata
+        # entries silently. Internal keys are never returned even if somehow in the list.
+        result_secrets = {}
+        for key in keys_to_return:
+            if key in all_data and not self.is_internal_project_secret_key(key):
+                result_secrets[key] = all_data[key]
+            # Keys present in metadata but absent from data are stale — silently skipped.
+
+        return mlrun.common.schemas.RetrievableSecretsData(
+            provider=mlrun.common.schemas.SecretProviderName.kubernetes,
+            secrets=result_secrets,
+        )
 
     def _resolve_project_secret_key(
         self,

@@ -619,7 +619,19 @@ class RunDBInterface(ABC):
             str, mlrun.common.schemas.SecretProviderName
         ] = mlrun.common.schemas.SecretProviderName.kubernetes,
         secrets: dict | None = None,
+        retrievable_keys: list[str] | None = None,
     ):
+        pass
+
+    @abstractmethod
+    def get_project_retrievable_secrets(
+        self,
+        project: str,
+        secrets: list[str] | None = None,
+        provider: Union[
+            str, mlrun.common.schemas.SecretProviderName
+        ] = mlrun.common.schemas.SecretProviderName.kubernetes,
+    ) -> mlrun.common.schemas.RetrievableSecretsData:
         pass
 
     def wait_for_background_task_to_reach_terminal_state(

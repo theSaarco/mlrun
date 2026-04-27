@@ -64,6 +64,43 @@ async def store_project_secrets(
     return fastapi.Response(status_code=HTTPStatus.CREATED.value)
 
 
+@router.get(
+    "/projects/{project}/secrets/retrievable",
+    response_model=mlrun.common.schemas.RetrievableSecretsData,
+)
+async def get_project_retrievable_secrets(
+    project: str,
+    secrets: list[str] = fastapi.Query(None, alias="secret"),
+    provider: mlrun.common.schemas.SecretProviderName = mlrun.common.schemas.SecretProviderName.kubernetes,
+    auth_info: mlrun.common.schemas.AuthInfo = fastapi.Depends(
+        framework.api.deps.authenticate_request
+    ),
+    db_session: Session = fastapi.Depends(framework.api.deps.get_db_session),
+):
+    await run_in_threadpool(
+        framework.utils.singletons.project_member.get_project_member().ensure_project,
+        db_session,
+        project,
+        auth_info=auth_info,
+    )
+    await (
+        framework.utils.auth.verifier.AuthVerifier().query_project_resource_permissions(
+            mlrun.common.schemas.AuthorizationResourceTypes.secret,
+            project,
+            provider,
+            mlrun.common.schemas.AuthorizationAction.read,
+            auth_info,
+        )
+    )
+    if provider != mlrun.common.schemas.SecretProviderName.kubernetes:
+        raise mlrun.errors.MLRunInvalidArgumentError(
+            "get_project_retrievable_secrets is only supported for the kubernetes provider"
+        )
+    return await run_in_threadpool(
+        services.api.crud.Secrets().list_retrievable_project_secrets, project, secrets
+    )
+
+
 @router.delete("/projects/{project}/secrets", status_code=HTTPStatus.NO_CONTENT.value)
 async def delete_project_secrets(
     project: str,

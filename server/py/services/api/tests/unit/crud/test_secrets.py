@@ -1198,3 +1198,327 @@ def test_get_secret_token_not_found():
 
 def _generate_token(payload: dict) -> str:
     return jwt.encode(payload, key="dummy", algorithm="HS256")
+
+
+# ---------------------------------------------------------------------------
+# Retrievable secrets tests
+# ---------------------------------------------------------------------------
+
+
+def test_store_retrievable_project_secrets_marks_keys(
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+    k8s_secrets_mock: services.api.tests.unit.conftest.APIK8sSecretsMock,
+):
+    """Store a key as retrievable — mlrun.retrievable-keys is written with that key."""
+    project = "proj-retrievable"
+    provider = mlrun.common.schemas.SecretProviderName.kubernetes
+
+    services.api.crud.Secrets().store_project_secrets(
+        project,
+        mlrun.common.schemas.SecretsData(
+            provider=provider,
+            secrets={"CIPHER_KEY": "ciphertext-value"},
+            retrievable_keys=["CIPHER_KEY"],
+        ),
+    )
+
+    secrets_crud = services.api.crud.Secrets()
+    retrievable_key_name = secrets_crud.retrievable_keys_secret_key
+    raw = k8s_secrets_mock.project_secrets_map[project][retrievable_key_name]
+    assert json.loads(raw) == ["CIPHER_KEY"]
+    assert k8s_secrets_mock.project_secrets_map[project]["CIPHER_KEY"] == "ciphertext-value"
+
+
+def test_store_retrievable_project_secrets_merges_existing_list(
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+    k8s_secrets_mock: services.api.tests.unit.conftest.APIK8sSecretsMock,
+):
+    """Two separate store calls with different retrievable keys — both end up in metadata."""
+    project = "proj-merge"
+    provider = mlrun.common.schemas.SecretProviderName.kubernetes
+
+    services.api.crud.Secrets().store_project_secrets(
+        project,
+        mlrun.common.schemas.SecretsData(
+            provider=provider,
+            secrets={"KEY_A": "val-a"},
+            retrievable_keys=["KEY_A"],
+        ),
+    )
+    services.api.crud.Secrets().store_project_secrets(
+        project,
+        mlrun.common.schemas.SecretsData(
+            provider=provider,
+            secrets={"KEY_B": "val-b"},
+            retrievable_keys=["KEY_B"],
+        ),
+    )
+
+    retrievable_key_name = services.api.crud.Secrets().retrievable_keys_secret_key
+    raw = k8s_secrets_mock.project_secrets_map[project][retrievable_key_name]
+    assert set(json.loads(raw)) == {"KEY_A", "KEY_B"}
+
+
+def test_store_retrievable_project_secrets_key_not_in_secrets_raises(
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+    k8s_secrets_mock: services.api.tests.unit.conftest.APIK8sSecretsMock,
+):
+    """Requesting a retrievable_key not present in secrets raises MLRunInvalidArgumentError."""
+    project = "proj-bad-rk"
+    provider = mlrun.common.schemas.SecretProviderName.kubernetes
+
+    with pytest.raises(mlrun.errors.MLRunInvalidArgumentError):
+        services.api.crud.Secrets().store_project_secrets(
+            project,
+            mlrun.common.schemas.SecretsData(
+                provider=provider,
+                secrets={"CIPHER_KEY": "val"},
+                retrievable_keys=["OTHER_KEY"],
+            ),
+        )
+
+
+def test_store_retrievable_project_secrets_internal_key_in_retrievable_raises(
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+    k8s_secrets_mock: services.api.tests.unit.conftest.APIK8sSecretsMock,
+):
+    """Attempting to mark an mlrun.* key as retrievable raises MLRunAccessDeniedError."""
+    project = "proj-internal-rk"
+    provider = mlrun.common.schemas.SecretProviderName.kubernetes
+
+    with pytest.raises(mlrun.errors.MLRunAccessDeniedError):
+        services.api.crud.Secrets().store_project_secrets(
+            project,
+            mlrun.common.schemas.SecretsData(
+                provider=provider,
+                secrets={"mlrun.something": "val"},
+                retrievable_keys=["mlrun.something"],
+            ),
+            allow_internal_secrets=True,
+        )
+
+
+def test_list_retrievable_project_secrets_returns_marked_keys(
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+    k8s_secrets_mock: services.api.tests.unit.conftest.APIK8sSecretsMock,
+):
+    """list_retrievable_project_secrets returns only retrievable keys, not plain ones."""
+    project = "proj-list-rk"
+    provider = mlrun.common.schemas.SecretProviderName.kubernetes
+
+    # Store one retrievable and one non-retrievable key in the same call.
+    services.api.crud.Secrets().store_project_secrets(
+        project,
+        mlrun.common.schemas.SecretsData(
+            provider=provider,
+            secrets={"CIPHER_KEY": "ciphertext", "PLAIN_KEY": "plain"},
+            retrievable_keys=["CIPHER_KEY"],
+        ),
+    )
+
+    result = services.api.crud.Secrets().list_retrievable_project_secrets(project)
+
+    assert result.provider == mlrun.common.schemas.SecretProviderName.kubernetes
+    assert result.secrets == {"CIPHER_KEY": "ciphertext"}
+    assert "PLAIN_KEY" not in result.secrets
+
+
+def test_list_retrievable_project_secrets_filter_by_name(
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+    k8s_secrets_mock: services.api.tests.unit.conftest.APIK8sSecretsMock,
+):
+    """Filtering by specific keys returns only the requested subset."""
+    project = "proj-filter-rk"
+    provider = mlrun.common.schemas.SecretProviderName.kubernetes
+
+    services.api.crud.Secrets().store_project_secrets(
+        project,
+        mlrun.common.schemas.SecretsData(
+            provider=provider,
+            secrets={"KEY_A": "val-a", "KEY_B": "val-b"},
+            retrievable_keys=["KEY_A", "KEY_B"],
+        ),
+    )
+
+    result = services.api.crud.Secrets().list_retrievable_project_secrets(
+        project, secrets=["KEY_A"]
+    )
+    assert result.secrets == {"KEY_A": "val-a"}
+    assert "KEY_B" not in result.secrets
+
+
+def test_list_retrievable_project_secrets_nonexistent_key_raises(
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+    k8s_secrets_mock: services.api.tests.unit.conftest.APIK8sSecretsMock,
+):
+    """Requesting a key that is not in the retrievable set raises MLRunNotFoundError."""
+    project = "proj-notfound-rk"
+    provider = mlrun.common.schemas.SecretProviderName.kubernetes
+
+    services.api.crud.Secrets().store_project_secrets(
+        project,
+        mlrun.common.schemas.SecretsData(
+            provider=provider,
+            secrets={"KEY_A": "val-a"},
+            retrievable_keys=["KEY_A"],
+        ),
+    )
+
+    with pytest.raises(mlrun.errors.MLRunNotFoundError):
+        services.api.crud.Secrets().list_retrievable_project_secrets(
+            project, secrets=["DOES_NOT_EXIST"]
+        )
+
+
+def test_list_retrievable_project_secrets_non_retrievable_key_raises(
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+    k8s_secrets_mock: services.api.tests.unit.conftest.APIK8sSecretsMock,
+):
+    """Requesting a key that exists but was not marked retrievable raises MLRunNotFoundError.
+
+    This test distinguishes from the never-stored case: KEY_A exists in K8s but
+    is not in the retrievable set — the API should still return 404.
+    """
+    project = "proj-nonretr-rk"
+    provider = mlrun.common.schemas.SecretProviderName.kubernetes
+
+    # Store KEY_A as non-retrievable and KEY_B as retrievable.
+    services.api.crud.Secrets().store_project_secrets(
+        project,
+        mlrun.common.schemas.SecretsData(
+            provider=provider,
+            secrets={"KEY_A": "plain-value", "KEY_B": "cipher"},
+            retrievable_keys=["KEY_B"],
+        ),
+    )
+
+    with pytest.raises(mlrun.errors.MLRunNotFoundError):
+        services.api.crud.Secrets().list_retrievable_project_secrets(
+            project, secrets=["KEY_A"]
+        )
+
+
+def test_list_retrievable_project_secrets_stale_metadata_ignored(
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+    k8s_secrets_mock: services.api.tests.unit.conftest.APIK8sSecretsMock,
+):
+    """Stale entries in mlrun.retrievable-keys (key removed externally) are silently skipped."""
+    project = "proj-stale-rk"
+    retrievable_key_name = services.api.crud.Secrets().retrievable_keys_secret_key
+
+    # Manually inject the metadata key without a corresponding data key.
+    k8s_secrets_mock.project_secrets_map[project] = {
+        retrievable_key_name: json.dumps(["STALE_KEY"])
+    }
+
+    result = services.api.crud.Secrets().list_retrievable_project_secrets(project)
+    assert result.secrets == {}
+
+
+def test_list_retrievable_project_secrets_empty_when_none_marked(
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+    k8s_secrets_mock: services.api.tests.unit.conftest.APIK8sSecretsMock,
+):
+    """When no keys are marked retrievable, list_retrievable_project_secrets returns empty."""
+    project = "proj-none-rk"
+    provider = mlrun.common.schemas.SecretProviderName.kubernetes
+
+    services.api.crud.Secrets().store_project_secrets(
+        project,
+        mlrun.common.schemas.SecretsData(
+            provider=provider,
+            secrets={"PLAIN_KEY": "plain"},
+        ),
+    )
+
+    result = services.api.crud.Secrets().list_retrievable_project_secrets(project)
+    assert result.secrets == {}
+
+
+def test_delete_retrievable_key_updates_metadata(
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+    k8s_secrets_mock: services.api.tests.unit.conftest.APIK8sSecretsMock,
+):
+    """Deleting a retrievable key removes it from mlrun.retrievable-keys metadata."""
+    project = "proj-del-rk"
+    provider = mlrun.common.schemas.SecretProviderName.kubernetes
+
+    services.api.crud.Secrets().store_project_secrets(
+        project,
+        mlrun.common.schemas.SecretsData(
+            provider=provider,
+            secrets={"KEY_A": "val-a", "KEY_B": "val-b"},
+            retrievable_keys=["KEY_A", "KEY_B"],
+        ),
+    )
+
+    services.api.crud.Secrets().delete_project_secrets(
+        project, provider, ["KEY_A"]
+    )
+
+    retrievable_key_name = services.api.crud.Secrets().retrievable_keys_secret_key
+    raw = k8s_secrets_mock.project_secrets_map[project][retrievable_key_name]
+    assert json.loads(raw) == ["KEY_B"]
+    assert "KEY_A" not in k8s_secrets_mock.project_secrets_map[project]
+
+
+def test_delete_all_removes_retrievable_metadata(
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+    k8s_secrets_mock: services.api.tests.unit.conftest.APIK8sSecretsMock,
+):
+    """Delete-all also removes the mlrun.retrievable-keys metadata key."""
+    project = "proj-delall-rk"
+    provider = mlrun.common.schemas.SecretProviderName.kubernetes
+
+    services.api.crud.Secrets().store_project_secrets(
+        project,
+        mlrun.common.schemas.SecretsData(
+            provider=provider,
+            secrets={"KEY_A": "val"},
+            retrievable_keys=["KEY_A"],
+        ),
+    )
+
+    # Pass empty list to trigger delete-all of user-visible keys.
+    services.api.crud.Secrets().delete_project_secrets(
+        project, provider, secrets=[]
+    )
+
+    retrievable_key_name = services.api.crud.Secrets().retrievable_keys_secret_key
+    # The entire project secrets map should be empty (or the key absent).
+    project_secrets = k8s_secrets_mock.project_secrets_map.get(project, {})
+    assert retrievable_key_name not in project_secrets
+
+
+def test_internal_keys_not_exposed_in_retrievable_listing(
+    db: sqlalchemy.orm.Session,
+    client: fastapi.testclient.TestClient,
+    k8s_secrets_mock: services.api.tests.unit.conftest.APIK8sSecretsMock,
+):
+    """Internal mlrun.* keys are never returned by list_retrievable_project_secrets."""
+    project = "proj-internal-exposed"
+    retrievable_key_name = services.api.crud.Secrets().retrievable_keys_secret_key
+
+    # Manually inject an internal key into both data and the metadata list.
+    # This tests the safety guard inside list_retrievable_project_secrets.
+    internal_key = "mlrun.some-internal"
+    k8s_secrets_mock.project_secrets_map[project] = {
+        retrievable_key_name: json.dumps([internal_key]),
+        internal_key: "internal-value",
+    }
+
+    result = services.api.crud.Secrets().list_retrievable_project_secrets(project)
+    assert internal_key not in result.secrets
+    assert result.secrets == {}

@@ -29,6 +29,12 @@ class SecretProviderName(mlrun.common.types.StrEnum):
 class SecretsData(BaseModel):
     provider: SecretProviderName = Field(SecretProviderName.vault)
     secrets: dict | None = {}
+    retrievable_keys: list[str] = Field(default_factory=list)
+
+
+class RetrievableSecretsData(BaseModel):
+    provider: SecretProviderName = Field(SecretProviderName.kubernetes)
+    secrets: dict[str, str] = Field(default_factory=dict)
 
 
 class AuthSecretData(BaseModel):

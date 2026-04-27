@@ -3509,6 +3509,7 @@ class HTTPRunDB(RunDBInterface):
             str, mlrun.common.schemas.SecretProviderName
         ] = mlrun.common.schemas.SecretProviderName.kubernetes,
         secrets: dict | None = None,
+        retrievable_keys: list[str] | None = None,
     ):
         """Create project-context secrets using either ``vault`` or ``kubernetes`` provider.
         When using with Vault, this will create needed Vault structures for storing secrets in project-context, and
@@ -3535,10 +3536,15 @@ class HTTPRunDB(RunDBInterface):
                     provider=mlrun.common.schemas.SecretProviderName.kubernetes,
                     secrets=secrets,
                 )
+        :param retrievable_keys: A list of key names (subset of ``secrets``) that should be
+            marked as retrievable via ``get_project_retrievable_secrets``. Only keys listed
+            here can be retrieved through the API later. Keys not listed are write-only.
         """
         path = f"projects/{project}/secrets"
         secrets_input = mlrun.common.schemas.SecretsData(
-            secrets=secrets, provider=provider
+            secrets=secrets,
+            provider=provider,
+            retrievable_keys=retrievable_keys or [],
         )
         body = secrets_input.dict()
         error_message = f"Failed creating secret provider {project}/{provider}"
@@ -3548,6 +3554,33 @@ class HTTPRunDB(RunDBInterface):
             error_message,
             body=dict_to_json(body),
         )
+
+    def get_project_retrievable_secrets(
+        self,
+        project: str,
+        secrets: list[str] | None = None,
+        provider: Union[
+            str, mlrun.common.schemas.SecretProviderName
+        ] = mlrun.common.schemas.SecretProviderName.kubernetes,
+    ) -> mlrun.common.schemas.RetrievableSecretsData:
+        """Retrieve pre-encrypted (user-encrypted) project secrets.
+
+        Returns only secrets that were stored with a ``retrievable_keys`` marking via
+        :py:meth:`create_project_secrets`. The returned values are ciphertexts exactly as
+        stored — the caller is responsible for decryption using their own private/symmetric key.
+
+        :param project: The project name.
+        :param secrets: A list of specific secret keys to retrieve. If ``None`` or empty,
+            retrieves all keys that are marked as retrievable.
+        :param provider: The secrets provider. Only ``kubernetes`` is supported.
+        :return: :py:class:`~mlrun.common.schemas.secret.RetrievableSecretsData` containing
+            the ciphertext values for marked keys.
+        """
+        path = f"projects/{project}/secrets/retrievable"
+        params = {"provider": provider, "secret": secrets}
+        error_message = f"Failed retrieving retrievable secrets {project}/{provider}"
+        result = self.api_call("GET", path, error_message, params=params)
+        return mlrun.common.schemas.RetrievableSecretsData(**result.json())
 
     def list_project_secrets(
         self,

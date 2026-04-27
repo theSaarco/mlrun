@@ -547,8 +547,19 @@ class NopDB(RunDBInterface):
             str, mlrun.common.schemas.SecretProviderName
         ] = mlrun.common.schemas.SecretProviderName.kubernetes,
         secrets: dict | None = None,
+        retrievable_keys: list[str] | None = None,
     ):
         pass
+
+    def get_project_retrievable_secrets(
+        self,
+        project: str,
+        secrets: list[str] | None = None,
+        provider: Union[
+            str, mlrun.common.schemas.SecretProviderName
+        ] = mlrun.common.schemas.SecretProviderName.kubernetes,
+    ) -> mlrun.common.schemas.RetrievableSecretsData:
+        return mlrun.common.schemas.RetrievableSecretsData()
 
     def list_project_secrets(
         self,
